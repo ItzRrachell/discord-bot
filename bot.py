@@ -4,7 +4,6 @@ from discord.ext import tasks
 import sqlite3
 import os
 from datetime import datetime, timezone
-import asyncio
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 
@@ -12,183 +11,168 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# --- Baza danych ---
-
 def init_db():
-    con = sqlite3.connect("ogloszenia.db")
+    con = sqlite3.connect("announcements.db")
     cur = con.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS ogloszenia (
+        CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER,
             channel_id INTEGER,
             role_id INTEGER,
-            tresc TEXT,
-            czas TEXT,
-            wyslane INTEGER DEFAULT 0
+            content TEXT,
+            send_at TEXT,
+            sent INTEGER DEFAULT 0
         )
     """)
     con.commit()
     con.close()
 
-def zapisz_ogloszenie(guild_id, channel_id, role_id, tresc, czas):
-    con = sqlite3.connect("ogloszenia.db")
+def save_announcement(guild_id, channel_id, role_id, content, send_at):
+    con = sqlite3.connect("announcements.db")
     cur = con.cursor()
     cur.execute(
-        "INSERT INTO ogloszenia (guild_id, channel_id, role_id, tresc, czas) VALUES (?,?,?,?,?)",
-        (guild_id, channel_id, role_id, tresc, czas)
+        "INSERT INTO announcements (guild_id, channel_id, role_id, content, send_at) VALUES (?,?,?,?,?)",
+        (guild_id, channel_id, role_id, content, send_at)
     )
-    oid = cur.lastrowid
+    aid = cur.lastrowid
     con.commit()
     con.close()
-    return oid
+    return aid
 
-def pobierz_oczekujace():
-    con = sqlite3.connect("ogloszenia.db")
+def get_pending():
+    con = sqlite3.connect("announcements.db")
     cur = con.cursor()
-    teraz = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     cur.execute(
-        "SELECT id, channel_id, role_id, tresc FROM ogloszenia WHERE wyslane=0 AND czas<=?",
-        (teraz,)
+        "SELECT id, channel_id, role_id, content FROM announcements WHERE sent=0 AND send_at<=?",
+        (now,)
     )
     rows = cur.fetchall()
     con.close()
     return rows
 
-def oznacz_wyslane(oid):
-    con = sqlite3.connect("ogloszenia.db")
+def mark_sent(aid):
+    con = sqlite3.connect("announcements.db")
     cur = con.cursor()
-    cur.execute("UPDATE ogloszenia SET wyslane=1 WHERE id=?", (oid,))
+    cur.execute("UPDATE announcements SET sent=1 WHERE id=?", (aid,))
     con.commit()
     con.close()
 
-def lista_nadchodzacych(guild_id):
-    con = sqlite3.connect("ogloszenia.db")
+def get_upcoming(guild_id):
+    con = sqlite3.connect("announcements.db")
     cur = con.cursor()
     cur.execute(
-        "SELECT id, channel_id, role_id, tresc, czas FROM ogloszenia WHERE guild_id=? AND wyslane=0 ORDER BY czas ASC LIMIT 10",
+        "SELECT id, channel_id, role_id, content, send_at FROM announcements WHERE guild_id=? AND sent=0 ORDER BY send_at ASC LIMIT 10",
         (guild_id,)
     )
     rows = cur.fetchall()
     con.close()
     return rows
 
-def usun_ogloszenie(oid, guild_id):
-    con = sqlite3.connect("ogloszenia.db")
+def delete_announcement(aid, guild_id):
+    con = sqlite3.connect("announcements.db")
     cur = con.cursor()
-    cur.execute("DELETE FROM ogloszenia WHERE id=? AND guild_id=? AND wyslane=0", (oid, guild_id))
-    zmienione = cur.rowcount
+    cur.execute("DELETE FROM announcements WHERE id=? AND guild_id=? AND sent=0", (aid, guild_id))
+    changed = cur.rowcount
     con.commit()
     con.close()
-    return zmienione > 0
-
-# --- Scheduler ---
+    return changed > 0
 
 @tasks.loop(seconds=30)
-async def sprawdz_ogloszenia():
-    oczekujace = pobierz_oczekujace()
-    for oid, channel_id, role_id, tresc in oczekujace:
-        kanal = client.get_channel(channel_id)
-        if kanal is None:
+async def check_announcements():
+    pending = get_pending()
+    for aid, channel_id, role_id, content in pending:
+        channel = client.get_channel(channel_id)
+        if channel is None:
             continue
-        if role_id:
-            wiadomosc = f"<@&{role_id}>\n\n{tresc}"
-        else:
-            wiadomosc = tresc
+        message = f"<@&{role_id}>\n\n{content}" if role_id else content
         try:
-            await kanal.send(wiadomosc)
-            oznacz_wyslane(oid)
+            await channel.send(message)
+            mark_sent(aid)
         except discord.Forbidden:
             pass
 
-# --- Komendy ---
-
-@tree.command(name="ogloszenie", description="Zaplanuj ogłoszenie na serwerze")
+@tree.command(name="announce", description="Schedule an announcement for your server")
 @app_commands.describe(
-    kanal="Kanał gdzie wysłać ogłoszenie",
-    data="Data w formacie RRRR-MM-DD (np. 2025-07-20)",
-    godzina="Godzina w formacie HH:MM UTC (np. 18:00)",
-    tresc="Treść ogłoszenia",
-    rola="Rola do oznaczenia (opcjonalne)"
+    channel="Channel to send the announcement in",
+    date="Date in YYYY-MM-DD format (e.g. 2025-07-20)",
+    time="Time in HH:MM UTC format (e.g. 18:00)",
+    content="The announcement text",
+    role="Role to mention (optional)"
 )
 @app_commands.default_permissions(manage_messages=True)
-async def ogloszenie(
+async def announce(
     interaction: discord.Interaction,
-    kanal: discord.TextChannel,
-    data: str,
-    godzina: str,
-    tresc: str,
-    rola: discord.Role = None
+    channel: discord.TextChannel,
+    date: str,
+    time: str,
+    content: str,
+    role: discord.Role = None
 ):
     try:
-        czas_str = f"{data} {godzina}"
-        datetime.strptime(czas_str, "%Y-%m-%d %H:%M")
+        send_at = f"{date} {time}"
+        datetime.strptime(send_at, "%Y-%m-%d %H:%M")
     except ValueError:
         await interaction.response.send_message(
-            "❌ Zły format daty lub godziny. Użyj: data `RRRR-MM-DD`, godzina `HH:MM`",
+            "❌ Invalid date or time format. Use: date `YYYY-MM-DD`, time `HH:MM`",
             ephemeral=True
         )
         return
 
-    role_id = rola.id if rola else None
-    oid = zapisz_ogloszenie(interaction.guild_id, kanal.id, role_id, tresc, czas_str)
+    role_id = role.id if role else None
+    aid = save_announcement(interaction.guild_id, channel.id, role_id, content, send_at)
 
-    rola_info = f" · Rola: {rola.mention}" if rola else ""
-    embed = discord.Embed(
-        title="✅ Ogłoszenie zaplanowane",
-        color=0x5865F2
-    )
-    embed.add_field(name="Kanał", value=kanal.mention, inline=True)
-    embed.add_field(name="Czas (UTC)", value=f"`{czas_str}`", inline=True)
-    embed.add_field(name="ID", value=f"`#{oid}`", inline=True)
-    embed.add_field(name="Treść", value=tresc[:500], inline=False)
-    if rola:
-        embed.add_field(name="Rola", value=rola.mention, inline=True)
-    embed.set_footer(text="Godzina w UTC. Polska: latem UTC+2, zimą UTC+1.")
+    embed = discord.Embed(title="✅ Announcement scheduled", color=0x5865F2)
+    embed.add_field(name="Channel", value=channel.mention, inline=True)
+    embed.add_field(name="Time (UTC)", value=f"`{send_at}`", inline=True)
+    embed.add_field(name="ID", value=f"`#{aid}`", inline=True)
+    embed.add_field(name="Content", value=content[:500], inline=False)
+    if role:
+        embed.add_field(name="Role", value=role.mention, inline=True)
+    embed.set_footer(text="Time is in UTC. Adjust for your timezone accordingly.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="lista", description="Pokaż nadchodzące ogłoszenia")
+@tree.command(name="list", description="Show upcoming scheduled announcements")
 @app_commands.default_permissions(manage_messages=True)
-async def lista(interaction: discord.Interaction):
-    ogloszenia = lista_nadchodzacych(interaction.guild_id)
-    if not ogloszenia:
-        await interaction.response.send_message("📭 Brak zaplanowanych ogłoszeń.", ephemeral=True)
+async def list_announcements(interaction: discord.Interaction):
+    announcements = get_upcoming(interaction.guild_id)
+    if not announcements:
+        await interaction.response.send_message("📭 No announcements scheduled.", ephemeral=True)
         return
 
-    embed = discord.Embed(title="📅 Nadchodzące ogłoszenia", color=0x5865F2)
-    for oid, channel_id, role_id, tresc, czas in ogloszenia:
-        kanal = client.get_channel(channel_id)
-        kanal_nazwa = kanal.mention if kanal else f"#{channel_id}"
-        rola_info = f" · <@&{role_id}>" if role_id else ""
+    embed = discord.Embed(title="📅 Upcoming announcements", color=0x5865F2)
+    for aid, channel_id, role_id, content, send_at in announcements:
+        channel = client.get_channel(channel_id)
+        channel_name = channel.mention if channel else f"#{channel_id}"
+        role_info = f" · <@&{role_id}>" if role_id else ""
         embed.add_field(
-            name=f"#{oid} · {czas} UTC",
-            value=f"{kanal_nazwa}{rola_info}\n{tresc[:100]}{'…' if len(tresc)>100 else ''}",
+            name=f"#{aid} · {send_at} UTC",
+            value=f"{channel_name}{role_info}\n{content[:100]}{'…' if len(content)>100 else ''}",
             inline=False
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="anuluj", description="Anuluj zaplanowane ogłoszenie po ID")
-@app_commands.describe(id="ID ogłoszenia (z /lista)")
+@tree.command(name="cancel", description="Cancel a scheduled announcement by ID")
+@app_commands.describe(id="Announcement ID (from /list)")
 @app_commands.default_permissions(manage_messages=True)
-async def anuluj(interaction: discord.Interaction, id: int):
-    if usun_ogloszenie(id, interaction.guild_id):
-        await interaction.response.send_message(f"🗑️ Ogłoszenie `#{id}` zostało anulowane.", ephemeral=True)
+async def cancel(interaction: discord.Interaction, id: int):
+    if delete_announcement(id, interaction.guild_id):
+        await interaction.response.send_message(f"🗑️ Announcement `#{id}` has been cancelled.", ephemeral=True)
     else:
         await interaction.response.send_message(
-            f"❌ Nie znaleziono ogłoszenia `#{id}` (lub już zostało wysłane).",
+            f"❌ Announcement `#{id}` not found (or already sent).",
             ephemeral=True
         )
-
-# --- Start ---
 
 @client.event
 async def on_ready():
     init_db()
     await tree.sync()
-    sprawdz_ogloszenia.start()
-    print(f"Bot działa jako {client.user}")
+    check_announcements.start()
+    print(f"Bot running as {client.user}")
 
 client.run(TOKEN)
