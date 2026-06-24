@@ -4,6 +4,7 @@ from discord.ext import tasks
 import sqlite3
 import os
 from datetime import datetime, timezone
+import calendar
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 
@@ -59,10 +60,7 @@ def get_pending():
     con = sqlite3.connect("announcements.db")
     cur = con.cursor()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    cur.execute(
-        "SELECT id, channel_id, role_id, content FROM announcements WHERE sent=0 AND send_at<=?",
-        (now,)
-    )
+    cur.execute("SELECT id, channel_id, role_id, content FROM announcements WHERE sent=0 AND send_at<=?", (now,))
     rows = cur.fetchall()
     con.close()
     return rows
@@ -93,8 +91,6 @@ def delete_announcement(aid, guild_id):
     con.commit()
     con.close()
     return changed > 0
-
-# --- Repeating ---
 
 def save_repeating(guild_id, channel_id, role_id, content, frequency, time):
     con = sqlite3.connect("announcements.db")
@@ -152,6 +148,22 @@ def edit_repeating(rid, guild_id, content):
     con.close()
     return changed > 0
 
+# --- Logic ---
+
+WEEKDAY_MAP = {
+    "monday": 0, "tuesday": 1, "wednesday": 2,
+    "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6
+}
+
+def get_weekdays_in_month(year, month, weekday):
+    cal = calendar.monthcalendar(year, month)
+    days = []
+    for week in cal:
+        d = week[weekday]
+        if d != 0:
+            days.append(d)
+    return days
+
 def should_send(frequency, time_str, last_sent):
     now = datetime.now(timezone.utc)
     now_time = now.strftime("%H:%M")
@@ -159,32 +171,66 @@ def should_send(frequency, time_str, last_sent):
 
     if now_time != time_str:
         return False
-
     if last_sent and last_sent == now_date:
         return False
 
-    weekday = now.weekday()  # 0=Monday, 6=Sunday
+    # frequency format: "every_N_months|weekday|occurrence"
+    # occurrence: 1st, 2nd, 3rd, 4th, last
 
-    freq_map = {
-        "every day": True,
-        "every monday": weekday == 0,
-        "every tuesday": weekday == 1,
-        "every wednesday": weekday == 2,
-        "every thursday": weekday == 3,
-        "every friday": weekday == 4,
-        "every saturday": weekday == 5,
-        "every sunday": weekday == 6,
-        "every week": weekday == 0,
-        "every month": now.day == 1,
+    if not frequency.startswith("every_"):
+        return False
+
+    parts = frequency.split("|")
+    if len(parts) != 3:
+        return False
+
+    period = parts[0]       # "every_N_months"
+    day_name = parts[1]     # "monday" etc
+    occurrence = parts[2]   # "1st", "2nd", "3rd", "4th", "last"
+
+    try:
+        interval = int(period.split("_")[1])
+    except (IndexError, ValueError):
+        return False
+
+    # Check month interval
+    if last_sent:
+        last_dt = datetime.strptime(last_sent, "%Y-%m-%d")
+        months_diff = (now.year - last_dt.year) * 12 + (now.month - last_dt.month)
+        if months_diff < interval:
+            return False
+
+    weekday = WEEKDAY_MAP.get(day_name)
+    if weekday is None:
+        return False
+
+    days = get_weekdays_in_month(now.year, now.month, weekday)
+    if not days:
+        return False
+
+    occ_map = {
+        "1st": 0,
+        "2nd": 1,
+        "3rd": 2,
+        "4th": 3,
     }
 
-    return freq_map.get(frequency, False)
+    if occurrence == "last":
+        target = days[-1]
+    elif occurrence in occ_map:
+        idx = occ_map[occurrence]
+        if idx >= len(days):
+            return False
+        target = days[idx]
+    else:
+        return False
+
+    return now.day == target
 
 # --- Scheduler ---
 
 @tasks.loop(seconds=60)
 async def check_announcements():
-    # One-time
     pending = get_pending()
     for aid, channel_id, role_id, content in pending:
         channel = client.get_channel(channel_id)
@@ -197,7 +243,6 @@ async def check_announcements():
         except discord.Forbidden:
             pass
 
-    # Repeating
     now_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     for rid, channel_id, role_id, content, frequency, time_str, last_sent in get_active_repeating():
         if not should_send(frequency, time_str, last_sent):
@@ -211,6 +256,35 @@ async def check_announcements():
             update_last_sent(rid, now_date)
         except discord.Forbidden:
             pass
+
+# --- Choices ---
+
+interval_choices = [
+    app_commands.Choice(name="Every 1 month", value=1),
+    app_commands.Choice(name="Every 2 months", value=2),
+    app_commands.Choice(name="Every 3 months", value=3),
+    app_commands.Choice(name="Every 4 months", value=4),
+    app_commands.Choice(name="Every 6 months", value=6),
+    app_commands.Choice(name="Every 12 months (yearly)", value=12),
+]
+
+occurrence_choices = [
+    app_commands.Choice(name="1st (first in month)", value="1st"),
+    app_commands.Choice(name="2nd (second in month)", value="2nd"),
+    app_commands.Choice(name="3rd (third in month)", value="3rd"),
+    app_commands.Choice(name="4th (fourth in month)", value="4th"),
+    app_commands.Choice(name="Last (last in month)", value="last"),
+]
+
+day_choices = [
+    app_commands.Choice(name="Monday", value="monday"),
+    app_commands.Choice(name="Tuesday", value="tuesday"),
+    app_commands.Choice(name="Wednesday", value="wednesday"),
+    app_commands.Choice(name="Thursday", value="thursday"),
+    app_commands.Choice(name="Friday", value="friday"),
+    app_commands.Choice(name="Saturday", value="saturday"),
+    app_commands.Choice(name="Sunday", value="sunday"),
+]
 
 # --- Commands ---
 
@@ -235,10 +309,7 @@ async def announce(
         send_at = f"{date} {time}"
         datetime.strptime(send_at, "%Y-%m-%d %H:%M")
     except ValueError:
-        await interaction.response.send_message(
-            "❌ Invalid format. Use: date `YYYY-MM-DD`, time `HH:MM`",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Invalid format. Use: date `YYYY-MM-DD`, time `HH:MM`", ephemeral=True)
         return
 
     role_id = role.id if role else None
@@ -255,33 +326,24 @@ async def announce(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-frequency_choices = [
-    app_commands.Choice(name="Every day", value="every day"),
-    app_commands.Choice(name="Every Monday", value="every monday"),
-    app_commands.Choice(name="Every Tuesday", value="every tuesday"),
-    app_commands.Choice(name="Every Wednesday", value="every wednesday"),
-    app_commands.Choice(name="Every Thursday", value="every thursday"),
-    app_commands.Choice(name="Every Friday", value="every friday"),
-    app_commands.Choice(name="Every Saturday", value="every saturday"),
-    app_commands.Choice(name="Every Sunday", value="every sunday"),
-    app_commands.Choice(name="Every week (Monday)", value="every week"),
-    app_commands.Choice(name="Every month (1st day)", value="every month"),
-]
-
 @tree.command(name="repeat", description="Create a repeating announcement")
 @app_commands.describe(
     channel="Channel to send the announcement in",
-    frequency="How often to send it",
+    every="How often (every N months)",
+    occurrence="Which occurrence of the day in that month",
+    day="Day of the week",
     time="Time in HH:MM UTC format (e.g. 18:00)",
     content="The announcement text",
     role="Role to mention (optional)"
 )
-@app_commands.choices(frequency=frequency_choices)
+@app_commands.choices(every=interval_choices, occurrence=occurrence_choices, day=day_choices)
 @app_commands.default_permissions(manage_messages=True)
 async def repeat(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
-    frequency: app_commands.Choice[str],
+    every: app_commands.Choice[int],
+    occurrence: app_commands.Choice[str],
+    day: app_commands.Choice[str],
     time: str,
     content: str,
     role: discord.Role = None
@@ -289,18 +351,17 @@ async def repeat(
     try:
         datetime.strptime(time, "%H:%M")
     except ValueError:
-        await interaction.response.send_message(
-            "❌ Invalid time format. Use `HH:MM` (e.g. `18:00`)",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ Invalid time format. Use `HH:MM` (e.g. `18:00`)", ephemeral=True)
         return
 
     role_id = role.id if role else None
-    rid = save_repeating(interaction.guild_id, channel.id, role_id, content, frequency.value, time)
+    frequency = f"every_{every.value}_months|{day.value}|{occurrence.value}"
+    rid = save_repeating(interaction.guild_id, channel.id, role_id, content, frequency, time)
 
     embed = discord.Embed(title="🔁 Repeating announcement created", color=0x57F287)
     embed.add_field(name="Channel", value=channel.mention, inline=True)
-    embed.add_field(name="Frequency", value=frequency.name, inline=True)
+    embed.add_field(name="Every", value=every.name, inline=True)
+    embed.add_field(name="When", value=f"{occurrence.name} {day.name}", inline=True)
     embed.add_field(name="Time (UTC)", value=f"`{time}`", inline=True)
     embed.add_field(name="ID", value=f"`#{rid}`", inline=True)
     embed.add_field(name="Content", value=content[:500], inline=False)
@@ -323,8 +384,14 @@ async def list_repeating(interaction: discord.Interaction):
         channel = client.get_channel(channel_id)
         channel_name = channel.mention if channel else f"#{channel_id}"
         role_info = f" · <@&{role_id}>" if role_id else ""
+        parts = frequency.split("|")
+        if len(parts) == 3:
+            interval = parts[0].replace("every_", "every ").replace("_months", " months")
+            freq_display = f"{interval} · {parts[2]} {parts[1]}"
+        else:
+            freq_display = frequency
         embed.add_field(
-            name=f"#{rid} · {frequency} at {time_str} UTC",
+            name=f"#{rid} · {freq_display} at {time_str} UTC",
             value=f"{channel_name}{role_info}\n{content[:100]}{'…' if len(content)>100 else ''}",
             inline=False
         )
